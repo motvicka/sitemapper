@@ -29,12 +29,14 @@ export default class Sitemapper {
    * @params {lastmod} [options.lastmod] - the minimum lastmod value for urls
    * @params {hpagent.HttpProxyAgent|hpagent.HttpsProxyAgent} [options.proxyAgent] - instance of npm "hpagent" HttpProxyAgent or HttpsProxyAgent to be passed to npm "got"
    * @params {Array<RegExp>} [options.exclusions] - Array of regex patterns to exclude URLs
+   * @params {AbortSignal} [options.signal] - AbortSignal to cancel the request
    *
    * @example let sitemap = new Sitemapper({
    *   url: 'https://wp.seantburke.com/sitemap.xml',
    *   timeout: 15000,
    *   lastmod: 1630693759,
-   *   exclusions: [/foo.com/, /bar.xml/] // Filters out URLs matching these patterns
+   *   exclusions: [/foo.com/, /bar.xml/], // Filters out URLs matching these patterns
+   *   signal: abortController.signal // For cancellation support
    *  });
    */
   constructor(options) {
@@ -52,6 +54,7 @@ export default class Sitemapper {
     this.fields = settings.fields || false;
     this.proxyAgent = settings.proxyAgent || {};
     this.exclusions = settings.exclusions || [];
+    this.signal = settings.signal;
   }
 
   /**
@@ -59,11 +62,23 @@ export default class Sitemapper {
    *
    * @public
    * @param {string} [url] - the Sitemaps url (e.g https://wp.seantburke.com/sitemap.xml)
+   * @param {Object} [options] - Additional options for this request
+   * @param {AbortSignal} [options.signal] - AbortSignal to cancel the request
    * @returns {Promise<SitesData>}
    * @example sitemapper.fetch('example.xml')
    *  .then((sites) => console.log(sites));
+   * @example sitemapper.fetch('example.xml', { signal: abortController.signal })
+   *  .then((sites) => console.log(sites));
    */
-  async fetch(url = this.url) {
+  async fetch(url = this.url, options = {}) {
+    // Use signal from options or fallback to instance signal
+    const signal = options.signal || this.signal;
+
+    // Check if already aborted
+    if (signal && signal.aborted) {
+      throw new Error('Request was aborted');
+    }
+
     // initialize empty variables
     let results = {
       url: '',
@@ -81,11 +96,16 @@ export default class Sitemapper {
 
     try {
       // crawl the URL
-      results = await this.crawl(url);
+      results = await this.crawl(url, 0, signal);
     } catch (e) {
       // show errors that may occur
       if (this.debug) {
         console.error(e);
+      }
+
+      // Re-throw abort errors
+      if (e.name === 'AbortError' || e.message === 'Request was aborted') {
+        throw e;
       }
     }
 
@@ -179,9 +199,15 @@ export default class Sitemapper {
    *
    * @private
    * @param {string} [url] - the Sitemaps url (e.g https://wp.seantburke.com/sitemap.xml)
+   * @param {AbortSignal} [signal] - AbortSignal to cancel the request
    * @returns {Promise<ParseData>}
    */
-  async parse(url = this.url) {
+  async parse(url = this.url, signal = null) {
+    // Check if already aborted
+    if (signal && signal.aborted) {
+      throw new Error('Request was aborted');
+    }
+
     // setup the response options for the got request
     const requestOptions = {
       method: 'GET',
@@ -195,12 +221,17 @@ export default class Sitemapper {
       agent: this.proxyAgent,
     };
 
+    // Add AbortSignal if provided
+    if (signal) {
+      requestOptions.signal = signal;
+    }
+
     try {
       // create a request Promise with the url and request options
       const requester = got.get(url, requestOptions);
 
       // initialize the timeout method based on the URL, and pass the request object.
-      this.initializeTimeout(url, requester);
+      this.initializeTimeout(url, requester, signal);
 
       // get the response from the requester promise
       const response = await requester;
@@ -231,6 +262,17 @@ export default class Sitemapper {
       // return the results
       return { error: null, data };
     } catch (error) {
+      // Clear timeout on any error
+      clearTimeout(this.timeoutTable[url]);
+
+      // If the request was aborted
+      if (
+        error.name === 'AbortError' ||
+        error.message === 'Request was aborted'
+      ) {
+        throw error; // Re-throw abort errors to be handled by caller
+      }
+
       // If the request was canceled notify the user of the timeout
       if (error.name === 'CancelError') {
         return {
@@ -262,10 +304,25 @@ export default class Sitemapper {
    * @private
    * @param {string} url - url to use as a hash in the timeoutTable
    * @param {Promise} requester - the promise that creates the web request to the url
+   * @param {AbortSignal} [signal] - AbortSignal to listen for cancellation
    */
-  initializeTimeout(url, requester) {
+  initializeTimeout(url, requester, signal = null) {
     // this will throw a CancelError which will be handled in the parent that calls this method.
     this.timeoutTable[url] = setTimeout(() => requester.cancel(), this.timeout);
+
+    // If AbortSignal is provided, listen for abort events
+    if (signal) {
+      const abortHandler = () => {
+        clearTimeout(this.timeoutTable[url]);
+        requester.cancel();
+      };
+
+      if (signal.aborted) {
+        abortHandler();
+      } else {
+        signal.addEventListener('abort', abortHandler, { once: true });
+      }
+    }
   }
 
   /**
@@ -276,9 +333,9 @@ export default class Sitemapper {
    * @param {integer} retryIndex - number of retry attempts fro this URL (e.g. 0 for 1st attempt, 1 for second attempty etc.)
    * @returns {Promise<SitesData>}
    */
-  async crawl(url, retryIndex = 0) {
+  async crawl(url, retryIndex = 0, signal = null) {
     try {
-      const { error, data } = await this.parse(url);
+      const { error, data } = await this.parse(url, signal);
       // The promise resolved, remove the timeout
       clearTimeout(this.timeoutTable[url]);
 
@@ -293,7 +350,7 @@ export default class Sitemapper {
               }) ${url} due to ${data.name} on previous request`
             );
           }
-          return this.crawl(url, retryIndex + 1);
+          return this.crawl(url, retryIndex + 1, signal);
         }
 
         if (this.debug) {
@@ -373,7 +430,7 @@ export default class Sitemapper {
         // Parse all child urls within the concurrency limit in the settings
         const limit = pLimit(this.concurrency);
         const promiseArray = sitemap.map((site) =>
-          limit(() => this.crawl(site))
+          limit(() => this.crawl(site, 0, signal))
         );
 
         // Make sure all the promises resolve then filter and reduce the array
@@ -400,7 +457,7 @@ export default class Sitemapper {
             }) ${url} due to ${data.name} on previous request`
           );
         }
-        return this.crawl(url, retryIndex + 1);
+        return this.crawl(url, retryIndex + 1, signal);
       }
       if (this.debug) {
         console.error(`Unknown state during "crawl('${url})'":`, error, data);
@@ -421,6 +478,11 @@ export default class Sitemapper {
     } catch (e) {
       if (this.debug) {
         this.debug && console.error(e);
+      }
+
+      // Re-throw abort errors
+      if (e.name === 'AbortError' || e.message === 'Request was aborted') {
+        throw e;
       }
     }
   }

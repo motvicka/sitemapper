@@ -7,7 +7,8 @@
       "Bash(npx mocha:*)",
       "Bash(grep:*)",
       "Bash(npm run lint:*)",
-      "Bash(npm run test:*)"
+      "Bash(npm run test:*)",
+      "Bash(node:*)"
     ],
     "deny": []
   }
