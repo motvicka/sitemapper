@@ -4,6 +4,5 @@ npm-debug.log
 .idea
 .vscode
 tmp
-lib
 .nyc_output
 coverage
